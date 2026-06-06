@@ -1,4 +1,4 @@
-use tauri::State;
+use tauri::{Manager, State};
 use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_opener::OpenerExt;
 use uuid::Uuid;
@@ -820,6 +820,46 @@ pub async fn sync_inbox(
 }
 
 #[tauri::command]
+pub async fn sync_inboxes(
+    app: tauri::AppHandle,
+    state: State<'_, crate::state::AppState>,
+) -> CmdResult<usize> {
+    let db = state.db.clone();
+    let inserted_by_account = tauri::async_runtime::spawn_blocking(move || {
+        let targets = inbox_sync_targets(&db)?;
+        let mut results = Vec::new();
+
+        for (account_id, folder_path) in targets {
+            match sync_folder_blocking(db.clone(), account_id.clone(), folder_path) {
+                Ok(inserted) => {
+                    if inserted > 0 {
+                        results.push((account_id, inserted));
+                    }
+                }
+                Err(_) => {
+                    // Background sync should not make one failing account block the rest.
+                }
+            }
+        }
+
+        Ok::<_, String>(results)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    let total = inserted_by_account
+        .iter()
+        .map(|(_, inserted)| *inserted)
+        .sum::<usize>();
+
+    for (account_id, inserted) in inserted_by_account {
+        show_new_mail_notification(&app, &state.db, &account_id, inserted);
+    }
+
+    Ok(total)
+}
+
+#[tauri::command]
 pub async fn sync_folder(
     app: tauri::AppHandle,
     state: State<'_, crate::state::AppState>,
@@ -844,18 +884,88 @@ pub async fn sync_folder(
     Ok(inserted)
 }
 
+#[tauri::command]
+pub async fn sync_folder_deep(
+    state: State<'_, crate::state::AppState>,
+    account_id: String,
+    folder_path: String,
+) -> CmdResult<usize> {
+    let db = state.db.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        sync_folder_blocking_with_limit(db, account_id, folder_path, 500)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 fn sync_folder_blocking(
     db: crate::db::Db,
     account_id: String,
     folder_path: String,
 ) -> CmdResult<usize> {
+    sync_folder_blocking_with_limit(db, account_id, folder_path, 50)
+}
+
+fn sync_folder_blocking_with_limit(
+    db: crate::db::Db,
+    account_id: String,
+    folder_path: String,
+    limit: usize,
+) -> CmdResult<usize> {
     if let Some(settings) = get_account_settings_from_db(&db, &account_id)? {
         let auth = get_account_auth(&db, &account_id)?;
 
-        return crate::mail::sync_imap_folder(&db, &account_id, &settings, &auth, &folder_path, 50);
+        return crate::mail::sync_imap_folder(&db, &account_id, &settings, &auth, &folder_path, limit);
     }
 
     Ok(0)
+}
+
+fn inbox_sync_targets(db: &crate::db::Db) -> CmdResult<Vec<(String, String)>> {
+    db.with_conn(|conn| {
+        let mut stmt = conn
+            .prepare(
+                "SELECT
+                   a.id,
+                   COALESCE(
+                     (
+                       SELECT f.path
+                       FROM folders f
+                       WHERE f.account_id = a.id
+                         AND f.selectable = 1
+                         AND (
+                           lower(f.path) = 'inbox'
+                           OR lower(f.name) LIKE '%inbox%'
+                           OR f.name LIKE '%收件%'
+                         )
+                       ORDER BY lower(f.path)
+                       LIMIT 1
+                     ),
+                     (
+                       SELECT f.path
+                       FROM folders f
+                       WHERE f.account_id = a.id AND f.selectable = 1
+                       ORDER BY lower(f.name), lower(f.path)
+                       LIMIT 1
+                     ),
+                     'INBOX'
+                   )
+                 FROM accounts a
+                 ORDER BY a.created_at DESC",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut targets = Vec::new();
+        for row in rows {
+            targets.push(row.map_err(|e| e.to_string())?);
+        }
+
+        Ok(targets)
+    })
 }
 
 fn show_new_mail_notification(
@@ -951,6 +1061,103 @@ pub fn list_messages(
 }
 
 #[tauri::command]
+pub fn search_messages(
+    state: State<'_, crate::state::AppState>,
+    query: String,
+    account_id: Option<String>,
+    limit: Option<i64>,
+) -> CmdResult<Vec<crate::models::MessageSummary>> {
+    use rusqlite::params;
+
+    let query = query.trim().to_string();
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let limit = limit.unwrap_or(100).clamp(1, 300);
+    let account_filter = account_id
+        .filter(|value| value != "all")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let pattern = format!("%{}%", query.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
+
+    state.db.with_conn(|conn| {
+        let sql = if account_filter.is_some() {
+            "SELECT
+               m.id, m.account_id, m.folder_path, m.subject, m.from_name, m.from_email,
+               m.to_emails, m.date_ts, m.snippet, m.is_read, COUNT(a.id) AS attachment_count
+             FROM messages m
+             LEFT JOIN attachments a ON a.message_id = m.id
+             WHERE m.account_id = ?1
+               AND (
+                 m.subject LIKE ?2 ESCAPE '\\'
+                 OR m.from_name LIKE ?2 ESCAPE '\\'
+                 OR m.from_email LIKE ?2 ESCAPE '\\'
+                 OR m.to_emails LIKE ?2 ESCAPE '\\'
+                 OR m.snippet LIKE ?2 ESCAPE '\\'
+                 OR m.body LIKE ?2 ESCAPE '\\'
+               )
+             GROUP BY m.id
+             ORDER BY m.date_ts DESC
+             LIMIT ?3"
+        } else {
+            "SELECT
+               m.id, m.account_id, m.folder_path, m.subject, m.from_name, m.from_email,
+               m.to_emails, m.date_ts, m.snippet, m.is_read, COUNT(a.id) AS attachment_count
+             FROM messages m
+             LEFT JOIN attachments a ON a.message_id = m.id
+             WHERE
+               m.subject LIKE ?1 ESCAPE '\\'
+               OR m.from_name LIKE ?1 ESCAPE '\\'
+               OR m.from_email LIKE ?1 ESCAPE '\\'
+               OR m.to_emails LIKE ?1 ESCAPE '\\'
+               OR m.snippet LIKE ?1 ESCAPE '\\'
+               OR m.body LIKE ?1 ESCAPE '\\'
+             GROUP BY m.id
+             ORDER BY m.date_ts DESC
+             LIMIT ?2"
+        };
+
+        let map_row = |row: &rusqlite::Row<'_>| {
+            let to_emails_json: String = row.get(6)?;
+            let to_emails: Vec<String> = serde_json::from_str(&to_emails_json).unwrap_or_default();
+            let is_read: i64 = row.get(9)?;
+            Ok(crate::models::MessageSummary {
+                id: row.get(0)?,
+                account_id: row.get(1)?,
+                folder_path: row.get(2)?,
+                subject: row.get(3)?,
+                from_name: row.get(4)?,
+                from_email: row.get(5)?,
+                to_emails,
+                date_ts: row.get(7)?,
+                snippet: row.get(8)?,
+                is_read: is_read != 0,
+                attachment_count: row.get(10)?,
+                tags: Vec::new(),
+            })
+        };
+
+        let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+        let rows = if let Some(account_id) = account_filter {
+            stmt.query_map(params![account_id, pattern, limit], map_row)
+                .map_err(|e| e.to_string())?
+        } else {
+            stmt.query_map(params![pattern, limit], map_row)
+                .map_err(|e| e.to_string())?
+        };
+
+        let mut out = Vec::new();
+        for row in rows {
+            let mut message = row.map_err(|e| e.to_string())?;
+            message.tags = read_message_tags(conn, &message.id)?;
+            out.push(message);
+        }
+        Ok(out)
+    })
+}
+
+#[tauri::command]
 pub fn get_message(
     state: State<'_, crate::state::AppState>,
     message_id: String,
@@ -1020,6 +1227,40 @@ pub fn get_message(
 }
 
 #[tauri::command]
+pub fn save_attachment(
+    app: tauri::AppHandle,
+    state: State<'_, crate::state::AppState>,
+    attachment_id: String,
+) -> CmdResult<String> {
+    let attachment = read_attachment_content(&state.db, &attachment_id)?;
+    let mut dir = app
+        .path()
+        .download_dir()
+        .or_else(|_| app.path().app_data_dir())
+        .map_err(|e| e.to_string())?;
+    dir.push("Wox Mail Attachments");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+
+    let filename = safe_attachment_filename(&attachment.filename);
+    let path = unique_attachment_path(dir, &filename);
+    std::fs::write(&path, attachment.content).map_err(|e| e.to_string())?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+pub fn open_attachment(
+    app: tauri::AppHandle,
+    state: State<'_, crate::state::AppState>,
+    attachment_id: String,
+) -> CmdResult<String> {
+    let path = save_attachment(app.clone(), state, attachment_id)?;
+    app.opener()
+        .open_path(path.clone(), None::<&str>)
+        .map_err(|e| e.to_string())?;
+    Ok(path)
+}
+
+#[tauri::command]
 pub fn list_unread_counts(
     state: State<'_, crate::state::AppState>,
 ) -> CmdResult<Vec<crate::models::UnreadCount>> {
@@ -1048,6 +1289,172 @@ pub fn list_unread_counts(
         }
         Ok(out)
     })
+}
+
+#[tauri::command]
+pub fn get_compose_draft(
+    state: State<'_, crate::state::AppState>,
+    scope: String,
+) -> CmdResult<Option<crate::models::ComposeDraft>> {
+    state.db.with_conn(|conn| {
+        let row = conn.query_row(
+            "SELECT scope, account_id, to_emails, subject, body, updated_at
+             FROM compose_drafts
+             WHERE scope = ?1",
+            rusqlite::params![scope],
+            |row| {
+                let to_emails_json: String = row.get(2)?;
+                let to_emails = serde_json::from_str(&to_emails_json).unwrap_or_default();
+                Ok(crate::models::ComposeDraft {
+                    scope: row.get(0)?,
+                    account_id: row.get(1)?,
+                    to_emails,
+                    subject: row.get(3)?,
+                    body: row.get(4)?,
+                    updated_at: row.get(5)?,
+                })
+            },
+        );
+        match row {
+            Ok(value) => Ok(Some(value)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.to_string()),
+        }
+    })
+}
+
+#[tauri::command]
+pub fn save_compose_draft(
+    state: State<'_, crate::state::AppState>,
+    input: crate::models::SaveComposeDraftInput,
+) -> CmdResult<()> {
+    let scope = input.scope.trim().to_string();
+    if scope.is_empty() {
+        return Err("草稿 scope 不能为空".to_string());
+    }
+
+    let now = crate::db::unix_ts_now();
+    let to_emails = serde_json::to_string(&input.to_emails).map_err(|e| e.to_string())?;
+    state.db.with_conn_mut(|conn| {
+        conn.execute(
+            "INSERT INTO compose_drafts (scope, account_id, to_emails, subject, body, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(scope) DO UPDATE SET
+               account_id = excluded.account_id,
+               to_emails = excluded.to_emails,
+               subject = excluded.subject,
+               body = excluded.body,
+               updated_at = excluded.updated_at",
+            rusqlite::params![
+                scope,
+                input.account_id,
+                to_emails,
+                input.subject,
+                input.body,
+                now
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    })
+}
+
+#[tauri::command]
+pub fn delete_compose_draft(
+    state: State<'_, crate::state::AppState>,
+    scope: String,
+) -> CmdResult<()> {
+    state.db.with_conn_mut(|conn| {
+        conn.execute(
+            "DELETE FROM compose_drafts WHERE scope = ?1",
+            rusqlite::params![scope],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    })
+}
+
+struct AttachmentContent {
+    filename: String,
+    content: Vec<u8>,
+}
+
+fn read_attachment_content(
+    db: &crate::db::Db,
+    attachment_id: &str,
+) -> CmdResult<AttachmentContent> {
+    db.with_conn(|conn| {
+        conn.query_row(
+            "SELECT filename, content FROM attachments WHERE id = ?1",
+            rusqlite::params![attachment_id],
+            |row| {
+                Ok(AttachmentContent {
+                    filename: row.get(0)?,
+                    content: row.get::<_, Option<Vec<u8>>>(1)?.unwrap_or_default(),
+                })
+            },
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => "附件不存在".to_string(),
+            _ => e.to_string(),
+        })
+        .and_then(|attachment| {
+            if attachment.content.is_empty() {
+                Err("该附件没有本地内容。请刷新或重新同步这封邮件后再试。".to_string())
+            } else {
+                Ok(attachment)
+            }
+        })
+    })
+}
+
+fn safe_attachment_filename(filename: &str) -> String {
+    let cleaned = filename
+        .chars()
+        .map(|ch| match ch {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+            ch if ch.is_control() => '_',
+            ch => ch,
+        })
+        .collect::<String>()
+        .trim()
+        .trim_matches('.')
+        .to_string();
+
+    if cleaned.is_empty() {
+        "attachment".to_string()
+    } else {
+        cleaned
+    }
+}
+
+fn unique_attachment_path(mut dir: std::path::PathBuf, filename: &str) -> std::path::PathBuf {
+    dir.push(filename);
+    if !dir.exists() {
+        return dir;
+    }
+
+    let original = dir.clone();
+    let stem = original
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("attachment");
+    let ext = original.extension().and_then(|value| value.to_str());
+    let parent = original.parent().map(std::path::Path::to_path_buf).unwrap_or_default();
+
+    for index in 1..10_000 {
+        let candidate_name = if let Some(ext) = ext {
+            format!("{stem} ({index}).{ext}")
+        } else {
+            format!("{stem} ({index})")
+        };
+        let candidate = parent.join(candidate_name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+
+    original
 }
 
 #[tauri::command]
@@ -1235,6 +1642,7 @@ pub fn send_message(
 
     let now = crate::db::unix_ts_now();
     let msg_id = Uuid::new_v4().to_string();
+    let is_html = input.is_html.unwrap_or(false);
     let to_emails_json =
         serde_json::to_string(&input.to_emails).unwrap_or_else(|_| "[]".to_string());
 
@@ -1258,11 +1666,17 @@ pub fn send_message(
             &input.to_emails,
             &input.subject,
             &input.body,
+            is_html,
         )?;
     }
 
     state.db.with_conn_mut(|conn| {
-        let snippet = input.body.lines().next().unwrap_or("").to_string();
+        let snippet_source = if is_html {
+            html_to_textish(&input.body)
+        } else {
+            input.body.clone()
+        };
+        let snippet = snippet_source.lines().next().unwrap_or("").to_string();
         let sent_folder_path = input
             .sent_folder_path
             .as_deref()
@@ -1292,4 +1706,24 @@ pub fn send_message(
     })?;
 
     Ok(msg_id)
+}
+
+fn html_to_textish(value: &str) -> String {
+    let mut out = String::new();
+    let mut in_tag = false;
+    for ch in value.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => {
+                in_tag = false;
+                out.push(' ');
+            }
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    out.replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
 }

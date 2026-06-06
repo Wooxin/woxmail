@@ -80,6 +80,16 @@ export interface SendMessageInput {
 	subject: string
 	body: string
 	sent_folder_path?: string
+	is_html?: boolean
+}
+
+export interface ComposeDraft {
+	scope: string
+	account_id: string
+	to_emails: string[]
+	subject: string
+	body: string
+	updated_at: number
 }
 
 export interface AccountSettings {

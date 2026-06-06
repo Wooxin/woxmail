@@ -2,6 +2,7 @@ import type {
   MailAccount,
   MailFolderInfo,
   AccountSettings,
+  ComposeDraft,
   MessageDetail,
   MessageSummary,
   SendMessageInput,
@@ -58,6 +59,19 @@ export async function syncFolder(accountId: string, folderPath: string, notify =
   )
 }
 
+export async function syncFolderDeep(accountId: string, folderPath: string): Promise<number> {
+  return tauriInvoke<number>(
+    "sync_folder_deep",
+    { accountId, folderPath },
+  )
+}
+
+export async function syncInboxes(): Promise<number> {
+  return tauriInvoke<number>(
+    "sync_inboxes",
+  )
+}
+
 export async function listFolders(accountId: string): Promise<MailFolderInfo[]> {
   return tauriInvoke<MailFolderInfo[]>(
     "list_folders",
@@ -82,6 +96,21 @@ export async function listMessages(input: {
   )
 }
 
+export async function searchMessages(input: {
+  query: string
+  accountId?: string
+  limit?: number
+}): Promise<MessageSummary[]> {
+  return tauriInvoke<MessageSummary[]>(
+    "search_messages",
+    {
+      query: input.query,
+      accountId: input.accountId,
+      limit: input.limit,
+    },
+  )
+}
+
 export async function listUnreadCounts(): Promise<UnreadCount[]> {
   return tauriInvoke<UnreadCount[]>(
     "list_unread_counts",
@@ -92,6 +121,20 @@ export async function getMessage(messageId: string): Promise<MessageDetail> {
   return tauriInvoke<MessageDetail>(
     "get_message",
     { messageId },
+  )
+}
+
+export async function saveAttachment(attachmentId: string): Promise<string> {
+  return tauriInvoke<string>(
+    "save_attachment",
+    { attachmentId },
+  )
+}
+
+export async function openAttachment(attachmentId: string): Promise<string> {
+  return tauriInvoke<string>(
+    "open_attachment",
+    { attachmentId },
   )
 }
 
@@ -127,6 +170,41 @@ export async function sendMessage(input: SendMessageInput): Promise<string> {
   return tauriInvoke<string>(
     "send_message",
     { input },
+  )
+}
+
+export async function getComposeDraft(scope: string): Promise<ComposeDraft | null> {
+  return tauriInvoke<ComposeDraft | null>(
+    "get_compose_draft",
+    { scope },
+  )
+}
+
+export async function saveComposeDraft(input: {
+  scope: string
+  accountId: string
+  toEmails: string[]
+  subject: string
+  body: string
+}): Promise<void> {
+  await tauriInvoke<void>(
+    "save_compose_draft",
+    {
+      input: {
+        scope: input.scope,
+        account_id: input.accountId,
+        to_emails: input.toEmails,
+        subject: input.subject,
+        body: input.body,
+      },
+    },
+  )
+}
+
+export async function deleteComposeDraft(scope: string): Promise<void> {
+  await tauriInvoke<void>(
+    "delete_compose_draft",
+    { scope },
   )
 }
 

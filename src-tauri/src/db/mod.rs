@@ -20,6 +20,7 @@ impl Db {
         dir.push("woxmail.db");
 
         let conn = Connection::open(dir).expect("failed to open sqlite db");
+        Self::configure(&conn);
         Self::migrate(&conn);
 
         Self {
@@ -41,6 +42,19 @@ impl Db {
     ) -> Result<T, String> {
         let mut conn = self.conn.lock().expect("db mutex poisoned");
         f(&mut conn)
+    }
+
+    fn configure(conn: &Connection) {
+        conn.execute_batch(
+            r#"
+PRAGMA journal_mode = WAL;
+PRAGMA synchronous = NORMAL;
+PRAGMA busy_timeout = 5000;
+PRAGMA temp_store = MEMORY;
+PRAGMA cache_size = -32768;
+            "#,
+        )
+        .expect("failed to configure sqlite db");
     }
 
     fn migrate(conn: &Connection) {
@@ -86,6 +100,7 @@ CREATE TABLE IF NOT EXISTS attachments (
   filename TEXT NOT NULL,
   mime_type TEXT NOT NULL,
   size_bytes INTEGER NOT NULL,
+  content BLOB,
   content_id TEXT,
   disposition TEXT NOT NULL,
   created_at INTEGER NOT NULL
@@ -137,6 +152,15 @@ CREATE TABLE IF NOT EXISTS message_tags (
   created_at INTEGER NOT NULL,
   PRIMARY KEY(message_id, tag)
 );
+
+CREATE TABLE IF NOT EXISTS compose_drafts (
+  scope TEXT PRIMARY KEY NOT NULL,
+  account_id TEXT NOT NULL,
+  to_emails TEXT NOT NULL,
+  subject TEXT NOT NULL,
+  body TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
             "#,
         )
         .expect("failed to run migrations");
@@ -180,6 +204,15 @@ CREATE TABLE IF NOT EXISTS message_tags (
             );
         }
 
+        let has_attachment_content = conn
+            .prepare("SELECT 1 FROM pragma_table_info('attachments') WHERE name = 'content' LIMIT 1")
+            .and_then(|mut s| s.exists([]))
+            .unwrap_or(false);
+
+        if !has_attachment_content {
+            let _ = conn.execute("ALTER TABLE attachments ADD COLUMN content BLOB", []);
+        }
+
         let _ = conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_source ON messages(account_id, folder_path, source_id)",
             [],
@@ -196,6 +229,11 @@ CREATE TABLE IF NOT EXISTS message_tags (
         );
 
         let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_unread ON messages(is_read, account_id, folder_path)",
+            [],
+        );
+
+        let _ = conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(message_id)",
             [],
         );
@@ -204,6 +242,8 @@ CREATE TABLE IF NOT EXISTS message_tags (
             "CREATE INDEX IF NOT EXISTS idx_message_tags_message ON message_tags(message_id)",
             [],
         );
+
+        let _ = conn.execute("PRAGMA optimize", []);
     }
 }
 

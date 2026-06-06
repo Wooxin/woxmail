@@ -19,6 +19,7 @@ import {
   outlookOAuthLogin,
   setAccountSettings,
   syncFolder,
+  syncInboxes,
 } from "./api/mail"
 import { isTauriRuntime } from "./api/tauri"
 
@@ -35,6 +36,7 @@ import { isSelectableFolder } from "./utils/folders"
 
 type AccountFilterId = "all" | string
 type SidebarAccountMode = "list" | "dropdown"
+const inboxBackgroundSyncMs = 5 * 60_000
 
 const providerPresets: Record<
   MailProvider,
@@ -231,6 +233,36 @@ function App() {
       cancelled = true
     }
   }, [])
+
+  useEffect(() => {
+    if (!isTauriRuntime() || accounts.length === 0) return
+
+    let syncing = false
+    let cancelled = false
+    const run = async () => {
+      if (syncing || cancelled) return
+      syncing = true
+      try {
+        const inserted = await syncInboxes()
+        if (!cancelled && inserted > 0) {
+          await refreshUnreadCounts()
+        }
+      } catch {
+        // Background inbox sync must stay quiet unless the user initiates it.
+      } finally {
+        syncing = false
+      }
+    }
+
+    const startupTimer = window.setTimeout(() => void run(), 8_000)
+    const interval = window.setInterval(() => void run(), inboxBackgroundSyncMs)
+
+    return () => {
+      cancelled = true
+      window.clearTimeout(startupTimer)
+      window.clearInterval(interval)
+    }
+  }, [accounts.length])
 
   const addAccount = (
     provider: MailProvider,

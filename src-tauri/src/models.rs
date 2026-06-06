@@ -82,6 +82,26 @@ pub struct SendMessageInput {
     pub subject: String,
     pub body: String,
     pub sent_folder_path: Option<String>,
+    pub is_html: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComposeDraft {
+    pub scope: String,
+    pub account_id: String,
+    pub to_emails: Vec<String>,
+    pub subject: String,
+    pub body: String,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SaveComposeDraftInput {
+    pub scope: String,
+    pub account_id: String,
+    pub to_emails: Vec<String>,
+    pub subject: String,
+    pub body: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

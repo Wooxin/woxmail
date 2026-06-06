@@ -17,6 +17,7 @@ struct AttachmentMeta {
     filename: String,
     mime_type: String,
     size_bytes: i64,
+    content: Vec<u8>,
     content_id: Option<String>,
     disposition: String,
 }
@@ -194,10 +195,10 @@ fn collect_attachments(parsed: &ParsedMail, attachments: &mut Vec<AttachmentMeta
         return;
     }
 
-    let size_bytes = parsed
+    let content = parsed
         .get_body_raw()
-        .map(|body| body.len() as i64)
-        .unwrap_or_else(|_| parsed.raw_bytes.len() as i64);
+        .unwrap_or_else(|_| parsed.raw_bytes.to_vec());
+    let size_bytes = content.len() as i64;
     let disposition_name = match disposition.disposition {
         DispositionType::Inline => "inline".to_string(),
         DispositionType::Attachment => "attachment".to_string(),
@@ -209,6 +210,7 @@ fn collect_attachments(parsed: &ParsedMail, attachments: &mut Vec<AttachmentMeta
         filename: filename.unwrap_or_else(|| "attachment".to_string()),
         mime_type: parsed.ctype.mimetype.clone(),
         size_bytes,
+        content,
         content_id: header_value(parsed, "Content-ID").map(|v| {
             v.trim()
                 .trim_start_matches('<')
@@ -482,14 +484,15 @@ fn sync_imap_session<T: Read + Write>(
                 if changed > 0 {
                     for attachment in &attachments {
                         tx.execute(
-                            "INSERT INTO attachments (id, message_id, filename, mime_type, size_bytes, content_id, disposition, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                            "INSERT INTO attachments (id, message_id, filename, mime_type, size_bytes, content, content_id, disposition, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                             params![
                                 Uuid::new_v4().to_string(),
                                 msg_id,
                                 attachment.filename,
                                 attachment.mime_type,
                                 attachment.size_bytes,
+                                attachment.content,
                                 attachment.content_id,
                                 attachment.disposition,
                                 now
@@ -724,6 +727,7 @@ pub fn send_smtp(
     to_emails: &[String],
     subject: &str,
     body: &str,
+    is_html: bool,
 ) -> Result<(), String> {
     let from_mb: Mailbox = format!("{from_name} <{from_email}>")
         .parse::<Mailbox>()
@@ -735,8 +739,14 @@ pub fn send_smtp(
         builder = builder.to(mb);
     }
 
+    let content_type = if is_html {
+        ContentType::TEXT_HTML
+    } else {
+        ContentType::TEXT_PLAIN
+    };
+
     let email = builder
-        .header(ContentType::TEXT_PLAIN)
+        .header(content_type)
         .body(body.to_string())
         .map_err(|e| e.to_string())?;
 

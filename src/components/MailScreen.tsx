@@ -6,12 +6,19 @@ import type { MailAccount, MailFolder, MailFolderInfo, MessageDetail, MessageSum
 import {
   addMessageTag,
   clearMessageTags,
+  deleteComposeDraft,
+  getComposeDraft,
   getMessage,
   listMessages,
   markMessageRead,
   moveMessagesToFolder,
+  openAttachment,
+  saveAttachment,
+  saveComposeDraft,
+  searchMessages,
   sendMessage,
   syncFolder,
+  syncFolderDeep,
 } from "../api/mail"
 import { folderDisplayName } from "../utils/folders"
 
@@ -37,6 +44,8 @@ type MessageGroup = {
 const pageSize = 50
 const backgroundSyncMs = 90_000
 const syncCooldownMs = 30_000
+const composeDraftScope = "compose:new"
+const signatureStorageKey = "woxmail.composeSignature"
 
 function formatTs(ts: number) {
   const d = new Date(ts * 1000)
@@ -57,6 +66,13 @@ function formatBytes(bytes: number) {
   return `${size >= 10 || unitIndex === 0 ? size.toFixed(0) : size.toFixed(1)} ${units[unitIndex]}`
 }
 
+function parseRecipientInput(value: string) {
+  return value
+    .split(/[,\s]+/)
+    .map((item) => item.trim())
+    .filter(Boolean)
+}
+
 function MailScreen({
   dark,
   accounts,
@@ -75,10 +91,13 @@ function MailScreen({
   const [sending, setSending] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [messages, setMessages] = useState<MessageSummary[]>([])
+  const [searchInput, setSearchInput] = useState("")
+  const [searching, setSearching] = useState(false)
   const [hasMore, setHasMore] = useState(false)
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [detail, setDetail] = useState<MessageDetail | null>(null)
   const [showCompose, setShowCompose] = useState(false)
+  const [composeMode, setComposeMode] = useState<"new" | "reply" | "forward">("new")
   const [contextMenu, setContextMenu] = useState<{
     x: number
     y: number
@@ -90,15 +109,27 @@ function MailScreen({
   const [toInput, setToInput] = useState("")
   const [subjectInput, setSubjectInput] = useState("")
   const [bodyInput, setBodyInput] = useState("")
+  const [signatureInput, setSignatureInput] = useState(() =>
+    window.localStorage.getItem(signatureStorageKey) ?? "",
+  )
+  const [draftStatus, setDraftStatus] = useState<"idle" | "saving" | "saved">("idle")
+  const bodyEditorRef = useRef<HTMLDivElement | null>(null)
 
   const selectedSummary = useMemo(
     () => messages.find((m) => m.id === selectedId) ?? null,
     [messages, selectedId],
   )
 
+  const searchQuery = searchInput.trim()
+  const isSearching = searchQuery.length > 0
+  const accountsById = useMemo(
+    () => new Map(accounts.map((account) => [account.id, account])),
+    [accounts],
+  )
+
   const messageGroups = useMemo(
-    () => groupMessagesByContact(messages, isSentFolder(folder)),
-    [folder, messages],
+    () => groupMessagesByContact(messages, isSearching ? false : isSentFolder(folder)),
+    [folder, isSearching, messages],
   )
 
   const activeAccounts = useMemo(
@@ -129,6 +160,103 @@ function MailScreen({
     }
   }, [accounts, fromAccountId])
 
+  useEffect(() => {
+    if (!showCompose || !bodyEditorRef.current) return
+    if (bodyEditorRef.current.innerHTML !== bodyInput) {
+      bodyEditorRef.current.innerHTML = bodyInput
+    }
+  }, [bodyInput, showCompose])
+
+  useEffect(() => {
+    if (!showCompose || composeMode !== "new") return
+
+    let cancelled = false
+    void (async () => {
+      try {
+        const draft = await getComposeDraft(composeDraftScope)
+        if (cancelled || !draft) return
+        if (accounts.some((account) => account.id === draft.account_id)) {
+          setFromAccountId(draft.account_id)
+        }
+        setToInput(draft.to_emails.join(", "))
+        setSubjectInput(draft.subject)
+        setBodyInput(draft.body)
+        setDraftStatus("saved")
+      } catch {
+        // Draft restore is a convenience; composing should still work if it fails.
+      }
+    })()
+
+    return () => {
+      cancelled = true
+    }
+  }, [accounts, composeMode, showCompose])
+
+  useEffect(() => {
+    if (!showCompose || sending || composeMode !== "new") return
+    if (!fromAccountId && !toInput.trim() && !subjectInput.trim() && !bodyInput.trim()) return
+
+    let cancelled = false
+    const timer = window.setTimeout(() => {
+      void (async () => {
+        setDraftStatus("saving")
+        try {
+          await saveComposeDraft({
+            scope: composeDraftScope,
+            accountId: fromAccountId || (accounts[0]?.id ?? ""),
+            toEmails: parseRecipientInput(toInput),
+            subject: subjectInput,
+            body: bodyInput,
+          })
+          if (!cancelled) setDraftStatus("saved")
+        } catch {
+          if (!cancelled) setDraftStatus("idle")
+        }
+      })()
+    }, 800)
+
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+    }
+  }, [accounts, bodyInput, composeMode, fromAccountId, sending, showCompose, subjectInput, toInput])
+
+  useEffect(() => {
+    if (!isSearching) return
+
+    let cancelled = false
+    const timer = window.setTimeout(() => {
+      void (async () => {
+        setSearching(true)
+        setError(null)
+        try {
+          const results = await searchMessages({
+            query: searchQuery,
+            accountId: accountFilterId,
+            limit: 150,
+          })
+          if (cancelled) return
+          setMessages(results)
+          setHasMore(false)
+          setSelectedId((current) =>
+            current && results.some((message) => message.id === current)
+              ? current
+              : results[0]?.id ?? null,
+          )
+        } catch (searchError) {
+          if (!cancelled) setError(getErrorMessage(searchError))
+        } finally {
+          if (!cancelled) setSearching(false)
+        }
+      })()
+    }, 250)
+
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+    }
+  }, [accountFilterId, isSearching, searchQuery])
+
   const loadMessages = async (
     nextFolder: MailFolder = folder,
     preferredMessageId?: string,
@@ -139,6 +267,8 @@ function MailScreen({
       forceSync?: boolean
     },
   ) => {
+    if (isSearching && !options?.skipSync) return
+
     const append = options?.append ?? false
     const background = options?.background ?? false
     const targetAccounts = getActiveAccountsForFolder(
@@ -234,29 +364,32 @@ function MailScreen({
   }
 
   useEffect(() => {
+    if (isSearching) return
     setMessages([])
     setSelectedId(null)
     setDetail(null)
     setHasMore(false)
     void loadMessages(folder)
-  }, [accountFilterId, accounts.length])
+  }, [accountFilterId, accounts.length, isSearching])
 
   useEffect(() => {
+    if (isSearching) return
     setMessages([])
     setSelectedId(null)
     setDetail(null)
     setHasMore(false)
     void loadMessages(folder)
-  }, [folder])
+  }, [folder, isSearching])
 
   useEffect(() => {
+    if (isSearching) return
     const id = window.setInterval(() => {
       if (loading || syncing || loadingMore || sending) return
       void loadMessages(folder, selectedId ?? undefined, { background: true })
     }, backgroundSyncMs)
 
     return () => window.clearInterval(id)
-  }, [accountFilterId, accounts.length, folder, loading, syncing, loadingMore, sending, selectedId, messages.length])
+  }, [accountFilterId, accounts.length, folder, isSearching, loading, syncing, loadingMore, sending, selectedId, messages.length])
 
   useEffect(() => {
     if (!selectedId) {
@@ -297,10 +430,7 @@ function MailScreen({
   }, [selectedId])
 
   const onSend = async () => {
-    const to = toInput
-      .split(/[,\s]+/)
-      .map((s) => s.trim())
-      .filter(Boolean)
+    const to = parseRecipientInput(toInput)
     if (to.length === 0) return
 
     setSending(true)
@@ -318,12 +448,15 @@ function MailScreen({
         subject: subjectInput.trim(),
         body: bodyInput,
         sent_folder_path: sentFolder,
+        is_html: true,
       })
 
       setShowCompose(false)
       setToInput("")
       setSubjectInput("")
       setBodyInput("")
+      setDraftStatus("idle")
+      await deleteComposeDraft(composeDraftScope).catch(() => undefined)
       onFolderChange(sentFolder)
       if (accountFilterId !== "all" && accountFilterId !== sendAccountId) {
         onAccountFilterChange(sendAccountId)
@@ -341,7 +474,81 @@ function MailScreen({
     void loadMessages(folder, selectedId ?? undefined, { append: true, skipSync: true })
   }
 
+  const deepSyncCurrentFolder = async () => {
+    if (isSearching || loading || syncing || loadingMore) return
+
+    setSyncing(true)
+    setError(null)
+    try {
+      const targetAccounts = getActiveAccountsForFolder(
+        accounts,
+        accountFilterId,
+        foldersByAccount,
+        folder,
+      )
+      const accountFolders = new Map(
+        targetAccounts.map((account) => [
+          account.id,
+          resolveFolderForAccount(account.id, foldersByAccount, folder),
+        ]),
+      )
+      let inserted = 0
+      await Promise.all(targetAccounts.map(async (account) => {
+        const accountFolder = accountFolders.get(account.id) ?? folder
+        inserted += await syncFolderDeep(account.id, accountFolder)
+        lastSyncAtRef.current[`${account.id}:${accountFolder}`] = Date.now()
+      }))
+      if (inserted > 0) {
+        void onUnreadCountsChanged()
+      }
+      await loadMessages(folder, selectedId ?? undefined, { skipSync: true })
+    } catch (syncError) {
+      setError(getErrorMessage(syncError))
+    } finally {
+      setSyncing(false)
+    }
+  }
+
   const closeContextMenu = () => setContextMenu(null)
+
+  const openNewCompose = () => {
+    setComposeMode("new")
+    if (!toInput.trim() && !subjectInput.trim() && !bodyInput.trim() && signatureInput.trim()) {
+      setBodyInput(`<br><br>${signatureHtml(signatureInput)}`)
+    }
+    setShowCompose(true)
+  }
+
+  const replyToDetail = () => {
+    if (!detail) return
+    setComposeMode("reply")
+    setToInput(detail.from_email)
+    setSubjectInput(replySubject(detail.subject))
+    setBodyInput(`<br><br>${quotedMessageHtml(detail)}`)
+    setShowCompose(true)
+    setDraftStatus("idle")
+  }
+
+  const forwardDetail = () => {
+    if (!detail) return
+    setComposeMode("forward")
+    setToInput("")
+    setSubjectInput(forwardSubject(detail.subject))
+    setBodyInput(`<br><br>${quotedMessageHtml(detail)}`)
+    setShowCompose(true)
+    setDraftStatus("idle")
+  }
+
+  const runFormatCommand = (command: string, value?: string) => {
+    bodyEditorRef.current?.focus()
+    document.execCommand(command, false, value)
+    setBodyInput(bodyEditorRef.current?.innerHTML ?? "")
+  }
+
+  const updateSignature = (value: string) => {
+    setSignatureInput(value)
+    window.localStorage.setItem(signatureStorageKey, value)
+  }
 
   const tagGroup = async (group: MessageGroup, tag: string) => {
     closeContextMenu()
@@ -391,6 +598,24 @@ function MailScreen({
     }
   }
 
+  const saveDetailAttachment = async (attachmentId: string) => {
+    setError(null)
+    try {
+      await saveAttachment(attachmentId)
+    } catch (attachmentError) {
+      setError(getErrorMessage(attachmentError))
+    }
+  }
+
+  const openDetailAttachment = async (attachmentId: string) => {
+    setError(null)
+    try {
+      await openAttachment(attachmentId)
+    } catch (attachmentError) {
+      setError(getErrorMessage(attachmentError))
+    }
+  }
+
   const archiveFolder = useMemo(
     () => findActionFolder(foldersByAccount, ["all mail", "archive", "归档", "所有邮件"]) ?? "Archive",
     [foldersByAccount],
@@ -414,11 +639,21 @@ function MailScreen({
         <div>
           <div className="text-lg font-semibold">{folderTitle}</div>
           <div className={`${dark ? "text-zinc-400" : "text-zinc-600"} text-sm`}>
-            {loading ? "正在加载..." : syncing ? "后台同步中..." : accountFilterId === "all" ? "全部邮箱" : activeAccounts[0]?.email}
+            {searching ? "正在搜索..." : isSearching ? `搜索：${searchQuery}` : loading ? "正在加载..." : syncing ? "后台同步中..." : accountFilterId === "all" ? "全部邮箱" : activeAccounts[0]?.email}
           </div>
         </div>
 
         <div className="flex items-center gap-2">
+          <input
+            value={searchInput}
+            onChange={(event) => setSearchInput(event.target.value)}
+            placeholder="搜索邮件"
+            className={`w-56 rounded-xl border px-3 py-2 text-sm outline-none ${
+              dark
+                ? "border-white/10 bg-[#151518] text-white placeholder:text-zinc-500"
+                : "border-black/10 bg-white text-black placeholder:text-zinc-500"
+            }`}
+          />
           <select
             value={accountFilterId}
             onChange={(event) => onAccountFilterChange(event.target.value)}
@@ -436,7 +671,7 @@ function MailScreen({
             ))}
           </select>
           <button
-            disabled={loading}
+            disabled={loading || isSearching}
             onClick={() => void loadMessages(folder, selectedId ?? undefined, { forceSync: true })}
             className={`flex items-center gap-2 rounded-xl px-3 py-2 text-sm transition ${
               dark ? "hover:bg-white/10" : "hover:bg-black/10"
@@ -446,7 +681,16 @@ function MailScreen({
             {loading ? "刷新中" : "刷新"}
           </button>
           <button
-            onClick={() => setShowCompose(true)}
+            disabled={loading || syncing || isSearching}
+            onClick={() => void deepSyncCurrentFolder()}
+            className={`rounded-xl px-3 py-2 text-sm transition ${
+              dark ? "hover:bg-white/10" : "hover:bg-black/10"
+            } disabled:opacity-50`}
+          >
+            {syncing ? "同步中" : "同步更多"}
+          </button>
+          <button
+            onClick={openNewCompose}
             className="flex items-center gap-2 rounded-xl bg-white px-3 py-2 text-sm font-medium text-black transition hover:scale-[1.02]"
           >
             <Plus size={16} />
@@ -474,13 +718,13 @@ function MailScreen({
             dark ? "border-white/10" : "border-black/10"
           } overflow-y-auto`}
         >
-          {loading && messages.length === 0 ? (
+          {(loading || searching) && messages.length === 0 ? (
             <div className={`p-6 ${dark ? "text-zinc-400" : "text-zinc-600"}`}>
-              正在加载邮件...
+              {searching ? "正在搜索邮件..." : "正在加载邮件..."}
             </div>
           ) : messages.length === 0 ? (
             <div className={`p-6 ${dark ? "text-zinc-400" : "text-zinc-600"}`}>
-              暂无邮件
+              {isSearching ? "没有找到匹配邮件" : "暂无邮件"}
             </div>
           ) : (
             <div className="p-3">
@@ -536,7 +780,9 @@ function MailScreen({
                     </div>
                   </div>
                   <div className={`${dark ? "text-zinc-400" : "text-zinc-600"} mt-1 truncate text-sm`}>
-                    {isSentFolder(folder)
+                    {isSearching
+                      ? `${accountsById.get(m.account_id)?.email ?? "邮箱"} · ${folderDisplayName(findFolderInfo(m.folder_path, foldersByAccount) ?? m.folder_path, t)}`
+                      : isSentFolder(folder)
                       ? `To: ${m.to_emails.join(", ")}`
                       : `${m.from_name} <${m.from_email}>`}
                   </div>
@@ -593,6 +839,24 @@ function MailScreen({
           ) : (
             <div>
               <div className="text-2xl font-bold">{detail.subject}</div>
+              <div className="mt-4 flex gap-2">
+                <button
+                  onClick={replyToDetail}
+                  className={`rounded-xl px-3 py-2 text-sm transition ${
+                    dark ? "bg-white/10 hover:bg-white/15" : "bg-black/10 hover:bg-black/15"
+                  }`}
+                >
+                  回复
+                </button>
+                <button
+                  onClick={forwardDetail}
+                  className={`rounded-xl px-3 py-2 text-sm transition ${
+                    dark ? "bg-white/10 hover:bg-white/15" : "bg-black/10 hover:bg-black/15"
+                  }`}
+                >
+                  转发
+                </button>
+              </div>
               <div className={`${dark ? "text-zinc-400" : "text-zinc-600"} mt-3 text-sm`}>
                 From: {detail.from_name} &lt;{detail.from_email}&gt;
               </div>
@@ -627,8 +891,26 @@ function MailScreen({
                             {attachment.mime_type}
                           </div>
                         </div>
-                        <div className={`${dark ? "text-zinc-400" : "text-zinc-600"} shrink-0 text-xs`}>
-                          {formatBytes(attachment.size_bytes)}
+                        <div className="flex shrink-0 items-center gap-2">
+                          <span className={`${dark ? "text-zinc-400" : "text-zinc-600"} text-xs`}>
+                            {formatBytes(attachment.size_bytes)}
+                          </span>
+                          <button
+                            onClick={() => void openDetailAttachment(attachment.id)}
+                            className={`rounded-lg px-2 py-1 text-xs transition ${
+                              dark ? "bg-white/10 hover:bg-white/15" : "bg-black/10 hover:bg-black/15"
+                            }`}
+                          >
+                            打开
+                          </button>
+                          <button
+                            onClick={() => void saveDetailAttachment(attachment.id)}
+                            className={`rounded-lg px-2 py-1 text-xs transition ${
+                              dark ? "bg-white/10 hover:bg-white/15" : "bg-black/10 hover:bg-black/15"
+                            }`}
+                          >
+                            保存
+                          </button>
                         </div>
                       </div>
                     ))}
@@ -694,7 +976,14 @@ function MailScreen({
             }`}
           >
             <div className="flex items-center justify-between">
-              <div className="text-lg font-semibold">写信</div>
+              <div>
+                <div className="text-lg font-semibold">
+                  {composeMode === "reply" ? "回复" : composeMode === "forward" ? "转发" : "写信"}
+                </div>
+                <div className={`${dark ? "text-zinc-500" : "text-zinc-600"} mt-1 text-xs`}>
+                  {draftStatus === "saving" ? "正在保存草稿..." : draftStatus === "saved" ? "草稿已保存" : "本地草稿"}
+                </div>
+              </div>
               <button
                 onClick={() => {
                   if (!sending) setShowCompose(false)
@@ -743,11 +1032,70 @@ function MailScreen({
                     : "border-black/10 bg-black/5 text-black placeholder:text-zinc-500"
                 }`}
               />
+              <div
+                className={`flex flex-wrap items-center gap-2 rounded-2xl border px-3 py-2 ${
+                  dark
+                    ? "border-white/10 bg-white/5"
+                    : "border-black/10 bg-black/5"
+                }`}
+              >
+                {[
+                  ["bold", "B"],
+                  ["italic", "I"],
+                  ["underline", "U"],
+                ].map(([command, label]) => (
+                  <button
+                    key={command}
+                    type="button"
+                    onClick={() => runFormatCommand(command)}
+                    className={`h-8 min-w-8 rounded-lg px-2 text-sm font-semibold transition ${
+                      dark ? "hover:bg-white/10" : "hover:bg-black/10"
+                    }`}
+                  >
+                    {label}
+                  </button>
+                ))}
+                <button
+                  type="button"
+                  onClick={() => runFormatCommand("insertUnorderedList")}
+                  className={`h-8 rounded-lg px-2 text-sm transition ${
+                    dark ? "hover:bg-white/10" : "hover:bg-black/10"
+                  }`}
+                >
+                  列表
+                </button>
+                <select
+                  onChange={(event) => {
+                    if (event.target.value) runFormatCommand("formatBlock", event.target.value)
+                    event.target.value = ""
+                  }}
+                  className={`h-8 rounded-lg border px-2 text-sm outline-none ${
+                    dark ? "border-white/10 bg-[#151518] text-white" : "border-black/10 bg-white text-black"
+                  }`}
+                >
+                  <option value="">样式</option>
+                  <option value="p">正文</option>
+                  <option value="h2">标题</option>
+                  <option value="blockquote">引用</option>
+                </select>
+              </div>
+              <div
+                ref={bodyEditorRef}
+                contentEditable
+                suppressContentEditableWarning
+                onInput={(event) => setBodyInput(event.currentTarget.innerHTML)}
+                data-placeholder="正文"
+                className={`min-h-64 w-full overflow-y-auto rounded-2xl border px-4 py-3 text-sm leading-7 outline-none ${
+                  dark
+                    ? "border-white/10 bg-white/5 text-white"
+                    : "border-black/10 bg-black/5 text-black"
+                }`}
+              />
               <textarea
-                value={bodyInput}
-                onChange={(e) => setBodyInput(e.target.value)}
-                placeholder="正文"
-                rows={10}
+                value={signatureInput}
+                onChange={(event) => updateSignature(event.target.value)}
+                placeholder="签名（新邮件会自动带上）"
+                rows={3}
                 className={`w-full resize-none rounded-2xl border px-4 py-3 text-sm outline-none ${
                   dark
                     ? "border-white/10 bg-white/5 text-white placeholder:text-zinc-500"
@@ -950,6 +1298,44 @@ function groupMessagesByContact(messages: MessageSummary[], sentFolder: boolean)
       }
     })
     .sort((a, b) => b.latest.date_ts - a.latest.date_ts)
+}
+
+function replySubject(subject: string) {
+  return subject.trim().toLowerCase().startsWith("re:")
+    ? subject
+    : `Re: ${subject}`
+}
+
+function forwardSubject(subject: string) {
+  return subject.trim().toLowerCase().startsWith("fw:")
+    || subject.trim().toLowerCase().startsWith("fwd:")
+    ? subject
+    : `Fwd: ${subject}`
+}
+
+function signatureHtml(value: string) {
+  return `<div>--</div><div>${escapeHtml(value).replace(/\n/g, "<br>")}</div>`
+}
+
+function quotedMessageHtml(message: MessageDetail) {
+  const header = [
+    "---- 原始邮件 ----",
+    `From: ${message.from_name} <${message.from_email}>`,
+    `To: ${message.to_emails.join(", ")}`,
+    `Date: ${formatTs(message.date_ts)}`,
+    `Subject: ${message.subject}`,
+    "",
+  ].join("\n")
+  return `<blockquote style="border-left:3px solid #94a3b8;margin:0;padding-left:12px;color:#64748b">${escapeHtml(`${header}${message.body}`).replace(/\n/g, "<br>")}</blockquote>`
+}
+
+function escapeHtml(value: string) {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;")
 }
 
 export default MailScreen
