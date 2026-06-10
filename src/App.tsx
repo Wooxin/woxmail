@@ -9,11 +9,11 @@ import type {
 } from "./types/mail"
 
 import {
+  batchInit,
   createAccount,
   deleteAccount,
   gmailOAuthLogin,
   getAccountSettings,
-  listAccounts,
   listFolders,
   listUnreadCounts,
   outlookOAuthLogin,
@@ -210,21 +210,19 @@ function App() {
       }
 
       try {
-        const list = await listAccounts()
+        // Single IPC call for accounts + unread counts
+        const init = await batchInit()
         if (cancelled) return
-        setAccounts(list)
+        setAccounts(init.accounts)
+        setUnreadCounts(init.unread_counts)
 
         // Load folders in background without blocking UI
-        list.forEach((account) => {
+        init.accounts.forEach((account) => {
           listFolders(account.id).then((folders) => {
             if (cancelled) return
             setFoldersByAccount((prev) => ({ ...prev, [account.id]: folders }))
           }).catch(() => {})
         })
-
-        const counts = await listUnreadCounts()
-        if (cancelled) return
-        setUnreadCounts(counts)
       } catch (error) {
         if (!cancelled) {
           setAccountError(getErrorMessage(error))

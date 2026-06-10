@@ -414,31 +414,39 @@ fn upsert_outlook_oauth_account(
 }
 
 #[tauri::command]
+pub fn batch_init(
+    state: State<'_, crate::state::AppState>,
+) -> CmdResult<serde_json::Value> {
+    let accounts = list_accounts_inner(&state.db)?;
+    let unread = list_unread_counts_inner(&state.db)?;
+    Ok(serde_json::json!({
+        "accounts": accounts,
+        "unread_counts": unread
+    }))
+}
+
+#[tauri::command]
 pub fn list_accounts(
     state: State<'_, crate::state::AppState>,
 ) -> CmdResult<Vec<crate::models::Account>> {
-    use rusqlite::params;
+    list_accounts_inner(&state.db)
+}
 
-    state.db.with_conn(|conn| {
+fn list_accounts_inner(db: &crate::db::Db) -> CmdResult<Vec<crate::models::Account>> {
+    use rusqlite::params;
+    db.with_conn(|conn| {
         let mut stmt = conn
             .prepare("SELECT id, provider, name, email FROM accounts ORDER BY created_at DESC")
             .map_err(|e| e.to_string())?;
-
         let rows = stmt
             .query_map(params![], |row| {
                 Ok(crate::models::Account {
-                    id: row.get(0)?,
-                    provider: row.get(1)?,
-                    name: row.get(2)?,
-                    email: row.get(3)?,
+                    id: row.get(0)?, provider: row.get(1)?, name: row.get(2)?, email: row.get(3)?,
                 })
             })
             .map_err(|e| e.to_string())?;
-
         let mut out = Vec::new();
-        for row in rows {
-            out.push(row.map_err(|e| e.to_string())?);
-        }
+        for row in rows { out.push(row.map_err(|e| e.to_string())?); }
         Ok(out)
     })
 }
@@ -1537,29 +1545,27 @@ pub fn open_attachment(
 pub fn list_unread_counts(
     state: State<'_, crate::state::AppState>,
 ) -> CmdResult<Vec<crate::models::UnreadCount>> {
-    state.db.with_conn(|conn| {
+    list_unread_counts_inner(&state.db)
+}
+
+fn list_unread_counts_inner(db: &crate::db::Db) -> CmdResult<Vec<crate::models::UnreadCount>> {
+    db.with_conn(|conn| {
         let mut stmt = conn
             .prepare(
                 "SELECT account_id, folder_path, COUNT(*)
-                 FROM messages
-                 WHERE is_read = 0
+                 FROM messages WHERE is_read = 0
                  GROUP BY account_id, folder_path",
             )
             .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map([], |row| {
                 Ok(crate::models::UnreadCount {
-                    account_id: row.get(0)?,
-                    folder_path: row.get(1)?,
-                    unread_count: row.get(2)?,
+                    account_id: row.get(0)?, folder_path: row.get(1)?, unread_count: row.get(2)?,
                 })
             })
             .map_err(|e| e.to_string())?;
-
         let mut out = Vec::new();
-        for row in rows {
-            out.push(row.map_err(|e| e.to_string())?);
-        }
+        for row in rows { out.push(row.map_err(|e| e.to_string())?); }
         Ok(out)
     })
 }

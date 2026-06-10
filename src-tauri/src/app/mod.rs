@@ -17,6 +17,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             crate::commands::add_message_tag,
             crate::commands::apply_filters,
+            crate::commands::batch_init,
             crate::commands::cancel_outbox_job,
             crate::commands::clear_cache,
             crate::commands::clear_message_tags,
