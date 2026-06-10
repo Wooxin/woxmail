@@ -395,18 +395,14 @@ function MailScreen({
 
   useEffect(() => {
     if (isSearching) return
-    setMessages([])
-    setSelectedId(null)
-    setDetail(null)
+    // Don't clear messages — keep old list until new data arrives
     setHasMore(false)
     void loadMessages(folder)
   }, [accountFilterId, accounts.length, isSearching])
 
   useEffect(() => {
     if (isSearching) return
-    setMessages([])
-    setSelectedId(null)
-    setDetail(null)
+    // Don't clear messages — keep old list until new data arrives
     setHasMore(false)
     void loadMessages(folder)
   }, [folder, isSearching])
@@ -427,35 +423,42 @@ function MailScreen({
       return
     }
     let cancelled = false
+    let timer: ReturnType<typeof setTimeout> | null = null
     void (async () => {
       setDetailLoading(true)
       setError(null)
       try {
         const msg = await getMessage(selectedId)
         if (cancelled) return
-        setDetail(msg)
-
-        if (!msg.is_read) {
-          await markMessageRead(msg.id)
+        // Debounce: only show detail after a short delay to avoid flicker on rapid clicks
+        timer = setTimeout(() => {
           if (cancelled) return
-          setDetail({ ...msg, is_read: true })
-          setMessages((current) =>
-            current.map((message) =>
-              message.id === msg.id ? { ...message, is_read: true } : message,
-            ),
-          )
-          void onUnreadCountsChanged()
-        }
+          setDetail(msg)
+          setDetailLoading(false)
+        }, 50)
       } catch (detailError) {
         if (!cancelled) {
           setError(getErrorMessage(detailError))
+          setDetailLoading(false)
         }
-      } finally {
-        if (!cancelled) setDetailLoading(false)
+      }
+
+      // Mark as read (don't block detail display)
+      if (!cancelled) {
+        await markMessageRead(selectedId).catch(() => {})
+        if (cancelled) return
+        setDetail((prev) => prev ? { ...prev, is_read: true } : null)
+        setMessages((current) =>
+          current.map((message) =>
+            message.id === selectedId ? { ...message, is_read: true } : message,
+          ),
+        )
+        void onUnreadCountsChanged()
       }
     })()
     return () => {
       cancelled = true
+      if (timer) clearTimeout(timer)
     }
   }, [selectedId])
 
@@ -1083,6 +1086,25 @@ function MailScreen({
             className={`w-full rounded-lg px-3 py-2 text-left transition ${dark ? "hover:bg-white/10" : "hover:bg-black/5"}`}
           >
             标记垃圾
+          </button>
+          <div className={`my-1 h-px ${dark ? "bg-white/10" : "bg-black/10"}`} />
+          <button
+            onClick={() => {
+              closeContextMenu()
+              void (async () => {
+                const ids = contextMenu.group.messages.map((m) => m.id)
+                for (const id of ids) {
+                  await markMessageRead(id).catch(() => {})
+                }
+                setMessages((current) =>
+                  current.map((m) => (ids.includes(m.id) ? { ...m, is_read: true } : m)),
+                )
+                void onUnreadCountsChanged()
+              })()
+            }}
+            className={`w-full rounded-lg px-3 py-2 text-left transition ${dark ? "hover:bg-white/10" : "hover:bg-black/5"}`}
+          >
+            标记已读
           </button>
         </div>
       )}

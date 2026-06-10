@@ -11,6 +11,10 @@ import type {
 } from "../types/mail"
 import { tauriInvoke } from "./tauri"
 
+export async function batchInit(): Promise<{ accounts: MailAccount[]; unread_counts: UnreadCount[] }> {
+  return tauriInvoke("batch_init")
+}
+
 export async function listAccounts(): Promise<MailAccount[]> {
   return tauriInvoke<MailAccount[]>(
     "list_accounts",
