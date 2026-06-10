@@ -19,8 +19,22 @@ import {
   sendMessage,
   syncFolder,
   syncFolderDeep,
+  translateMessage,
+  getThread,
 } from "../api/mail"
+import HtmlRenderer from "./HtmlRenderer"
+import { listContacts } from "../api/contact"
+import { openExternalUrl } from "../api/open"
 import { folderDisplayName } from "../utils/folders"
+
+function linkifyUrls(text: string): string {
+  if (!text) return text
+  // Match http/https URLs
+  return text.replace(
+    /(https?:\/\/[^\s<>"']+)/g,
+    '<a href="$1" class="auto-link" target="_blank" rel="noopener noreferrer">$1</a>'
+  )
+}
 
 type Props = {
   dark: boolean
@@ -66,6 +80,12 @@ function formatBytes(bytes: number) {
   return `${size >= 10 || unitIndex === 0 ? size.toFixed(0) : size.toFixed(1)} ${units[unitIndex]}`
 }
 
+function looksLikeHtml(text: string): boolean {
+  if (!text || text.length < 10) return false
+  const lower = text.slice(0, 2000).toLowerCase()
+  return /<\s*(html|body|div|table|p|br|a\s|img\s|span|style|head|meta)/.test(lower)
+}
+
 function parseRecipientInput(value: string) {
   return value
     .split(/[,\s]+/)
@@ -88,6 +108,10 @@ function MailScreen({
   const [syncing, setSyncing] = useState(false)
   const [loadingMore, setLoadingMore] = useState(false)
   const [detailLoading, setDetailLoading] = useState(false)
+  const [translating, setTranslating] = useState(false)
+  const [translatedBody, setTranslatedBody] = useState<string | null>(null)
+  const [threadMessages, setThreadMessages] = useState<MessageSummary[] | null>(null)
+  const [threadLoading, setThreadLoading] = useState(false)
   const [sending, setSending] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [messages, setMessages] = useState<MessageSummary[]>([])
@@ -107,6 +131,8 @@ function MailScreen({
 
   const [fromAccountId, setFromAccountId] = useState(accounts[0]?.id ?? "")
   const [toInput, setToInput] = useState("")
+  const [contactSuggestions, setContactSuggestions] = useState<{ name: string; email: string }[]>([])
+  const [suggestionIndex, setSuggestionIndex] = useState(-1)
   const [subjectInput, setSubjectInput] = useState("")
   const [bodyInput, setBodyInput] = useState("")
   const [signatureInput, setSignatureInput] = useState(() =>
@@ -333,6 +359,7 @@ function MailScreen({
         setLoading(false)
       }
 
+      // Fire sync in background — don't block UI
       if (!options?.skipSync && !append) {
         const now = Date.now()
         const accountsToSync = targetAccounts.filter((account) => {
@@ -341,19 +368,22 @@ function MailScreen({
           return options?.forceSync || now - (lastSyncAtRef.current[key] ?? 0) > syncCooldownMs
         })
 
-        let syncedNewMessages = 0
-        await Promise.all(accountsToSync.map(async (account) => {
-          const accountFolder = accountFolders.get(account.id) ?? nextFolder
-          const inserted = await syncFolder(account.id, accountFolder)
-          syncedNewMessages += inserted
-          lastSyncAtRef.current[`${account.id}:${accountFolder}`] = Date.now()
-        }))
-        if (syncedNewMessages > 0) {
-          void onUnreadCountsChanged()
+        if (accountsToSync.length > 0) {
+          // Don't await — run sync in background
+          Promise.all(accountsToSync.map(async (account) => {
+            const accountFolder = accountFolders.get(account.id) ?? nextFolder
+            await syncFolder(account.id, accountFolder)
+            lastSyncAtRef.current[`${account.id}:${accountFolder}`] = Date.now()
+          })).then(async () => {
+            await onUnreadCountsChanged()
+            applyMessages(await readMessages())
+          }).catch(() => {})
         }
       }
 
-      applyMessages(await readMessages())
+      if (append || background) {
+        applyMessages(await readMessages())
+      }
     } catch (loadError) {
       if (!background) setError(getErrorMessage(loadError))
     } finally {
@@ -492,13 +522,14 @@ function MailScreen({
           resolveFolderForAccount(account.id, foldersByAccount, folder),
         ]),
       )
-      let inserted = 0
+      let didSync = false
       await Promise.all(targetAccounts.map(async (account) => {
         const accountFolder = accountFolders.get(account.id) ?? folder
-        inserted += await syncFolderDeep(account.id, accountFolder)
+        await syncFolderDeep(account.id, accountFolder)
+        didSync = true
         lastSyncAtRef.current[`${account.id}:${accountFolder}`] = Date.now()
       }))
-      if (inserted > 0) {
+      if (didSync) {
         void onUnreadCountsChanged()
       }
       await loadMessages(folder, selectedId ?? undefined, { skipSync: true })
@@ -856,6 +887,38 @@ function MailScreen({
                 >
                   转发
                 </button>
+                <button
+                  onClick={() => {
+                    if (!detail) return
+                    if (translatedBody) { setTranslatedBody(null); return }
+                    setTranslating(true)
+                    translateMessage(detail.body)
+                      .then(setTranslatedBody)
+                      .catch((e) => setError(getErrorMessage(e)))
+                      .finally(() => setTranslating(false))
+                  }}
+                  className={`rounded-xl px-3 py-2 text-sm transition ${
+                    dark ? "bg-white/10 hover:bg-white/15" : "bg-black/10 hover:bg-black/15"
+                  }`}
+                >
+                  {translating ? "翻译中..." : translatedBody ? "显示原文" : "翻译"}
+                </button>
+                <button
+                  onClick={() => {
+                    if (!detail) return
+                    if (threadMessages) { setThreadMessages(null); return }
+                    setThreadLoading(true)
+                    getThread(detail.id, detail.account_id)
+                      .then(setThreadMessages)
+                      .catch(() => {})
+                      .finally(() => setThreadLoading(false))
+                  }}
+                  className={`rounded-xl px-3 py-2 text-sm transition ${
+                    dark ? "bg-white/10 hover:bg-white/15" : "bg-black/10 hover:bg-black/15"
+                  }`}
+                >
+                  {threadLoading ? "加载中..." : threadMessages ? "收起会话" : "会话"}
+                </button>
               </div>
               <div className={`${dark ? "text-zinc-400" : "text-zinc-600"} mt-3 text-sm`}>
                 From: {detail.from_name} &lt;{detail.from_email}&gt;
@@ -866,6 +929,36 @@ function MailScreen({
               <div className={`${dark ? "text-zinc-500" : "text-zinc-600"} mt-1 text-sm`}>
                 Date: {formatTs(detail.date_ts)}
               </div>
+
+              {threadMessages && threadMessages.length > 1 && (
+                <div className={`mt-4 rounded-2xl border p-3 ${dark ? "border-white/10 bg-white/[0.03]" : "border-black/10 bg-black/[0.03]"}`}>
+                  <div className="mb-2 text-sm font-semibold">
+                    会话 ({threadMessages.length} 封)
+                  </div>
+                  <div className="space-y-1 max-h-64 overflow-y-auto">
+                    {threadMessages.map((tm) => (
+                      <button
+                        key={tm.id}
+                        onClick={() => setSelectedId(tm.id)}
+                        className={`w-full rounded-xl px-3 py-2 text-left text-sm transition ${
+                          tm.id === detail.id
+                            ? dark ? "bg-blue-500/20" : "bg-blue-500/10"
+                            : dark ? "hover:bg-white/5" : "hover:bg-black/5"
+                        }`}
+                      >
+                        <div className="flex items-center gap-2">
+                          {!tm.is_read && <span className="h-2 w-2 shrink-0 rounded-full bg-blue-500" />}
+                          <span className="font-medium truncate">{tm.from_name}</span>
+                          <span className={`truncate text-xs ${dark ? "text-zinc-500" : "text-zinc-400"}`}>
+                            {formatTs(tm.date_ts)}
+                          </span>
+                        </div>
+                        <div className="truncate text-xs mt-0.5">{tm.subject}</div>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
 
               {detail.attachments.length > 0 && (
                 <div
@@ -919,7 +1012,33 @@ function MailScreen({
               )}
 
               <div className={`mt-6 whitespace-pre-wrap leading-7 ${dark ? "text-zinc-100" : "text-zinc-900"}`}>
-                {detail.body}
+                {translatedBody ? (
+                  <div>
+                    <div className={`mb-3 rounded-xl px-4 py-2 text-sm ${dark ? "bg-blue-500/10 text-blue-300" : "bg-blue-500/5 text-blue-600"}`}>
+                      🌐 翻译结果 (Bing Translator)
+                    </div>
+                    {translatedBody}
+                  </div>
+                ) : detail.body_html ? (
+                  <HtmlRenderer html={detail.body_html} text={detail.body} dark={dark} />
+                ) : looksLikeHtml(detail.body) ? (
+                  <HtmlRenderer html={detail.body} text={detail.body} dark={dark} />
+                ) : (
+                  <div
+                    ref={(el) => {
+                      if (!el) return
+                      const handler = (e: MouseEvent) => {
+                        const anchor = (e.target as HTMLElement).closest("a")
+                        if (anchor?.href?.startsWith("http")) {
+                          e.preventDefault()
+                          openExternalUrl(anchor.href)
+                        }
+                      }
+                      el.addEventListener("click", handler)
+                    }}
+                    dangerouslySetInnerHTML={{ __html: linkifyUrls(detail.body).replace(/\n/g, "<br>") }}
+                  />
+                )}
               </div>
             </div>
           )}
@@ -969,9 +1088,14 @@ function MailScreen({
       )}
 
       {showCompose && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6">
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6"
+          onClick={(e) => {
+            if (e.target === e.currentTarget && !sending) setShowCompose(false)
+          }}
+        >
           <div
-            className={`w-full max-w-3xl rounded-3xl border p-6 ${
+            className={`w-full max-w-3xl max-h-[90vh] overflow-y-auto rounded-3xl border p-6 ${
               dark ? "border-white/10 bg-[#0f0f12]" : "border-black/10 bg-white"
             }`}
           >
@@ -1012,16 +1136,79 @@ function MailScreen({
                   </option>
                 ))}
               </select>
-              <input
-                value={toInput}
-                onChange={(e) => setToInput(e.target.value)}
-                placeholder="收件人（逗号或空格分隔）"
-                className={`w-full rounded-2xl border px-4 py-3 text-sm outline-none ${
-                  dark
-                    ? "border-white/10 bg-white/5 text-white placeholder:text-zinc-500"
-                    : "border-black/10 bg-black/5 text-black placeholder:text-zinc-500"
-                }`}
-              />
+              <div className="relative">
+                <input
+                  value={toInput}
+                  onChange={async (e) => {
+                    setToInput(e.target.value)
+                    setSuggestionIndex(-1)
+                    const val = e.target.value
+                    const lastPart = val.split(/[,\s]+/).pop() ?? ""
+                    if (lastPart.length >= 1) {
+                      try {
+                        const contacts = await listContacts(lastPart)
+                        setContactSuggestions(contacts.slice(0, 5))
+                      } catch { setContactSuggestions([]) }
+                    } else { setContactSuggestions([]) }
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "ArrowDown") {
+                      e.preventDefault()
+                      setSuggestionIndex((i) => Math.min(i + 1, contactSuggestions.length - 1))
+                    } else if (e.key === "ArrowUp") {
+                      e.preventDefault()
+                      setSuggestionIndex((i) => Math.max(i - 1, -1))
+                    } else if (e.key === "Enter" && suggestionIndex >= 0) {
+                      e.preventDefault()
+                      const sel = contactSuggestions[suggestionIndex]
+                      if (sel) {
+                        const parts = toInput.split(/[,\s]+/).filter(Boolean)
+                        parts.pop()
+                        parts.push(`${sel.name} <${sel.email}>`)
+                        setToInput(parts.join(", ") + ", ")
+                        setContactSuggestions([])
+                        setSuggestionIndex(-1)
+                      }
+                    } else if (e.key === "Escape") {
+                      setContactSuggestions([])
+                      setSuggestionIndex(-1)
+                    }
+                  }}
+                  placeholder="收件人（逗号或空格分隔）"
+                  className={`w-full rounded-2xl border px-4 py-3 text-sm outline-none ${
+                    dark
+                      ? "border-white/10 bg-white/5 text-white placeholder:text-zinc-500"
+                      : "border-black/10 bg-black/5 text-black placeholder:text-zinc-500"
+                  }`}
+                />
+                {contactSuggestions.length > 0 && (
+                  <div className={`absolute left-0 right-0 top-full z-50 mt-1 rounded-2xl border p-1 shadow-2xl ${
+                    dark ? "border-white/10 bg-[#151518]" : "border-black/10 bg-white"
+                  }`}>
+                    {contactSuggestions.map((c, idx) => (
+                      <button
+                        key={c.email}
+                        onClick={() => {
+                          const parts = toInput.split(/[,\s]+/).filter(Boolean)
+                          parts.pop()
+                          parts.push(`${c.name} <${c.email}>`)
+                          setToInput(parts.join(", ") + ", ")
+                          setContactSuggestions([])
+                          setSuggestionIndex(-1)
+                        }}
+                        className={`flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left text-sm transition ${
+                          idx === suggestionIndex
+                            ? dark ? "bg-white/10" : "bg-black/10"
+                            : dark ? "hover:bg-white/5" : "hover:bg-black/5"
+                        }`}
+                      >
+                        <span className="flex-1 truncate">{c.name}</span>
+                        <span className={dark ? "text-zinc-500" : "text-zinc-400"}>{c.email}</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
               <input
                 value={subjectInput}
                 onChange={(e) => setSubjectInput(e.target.value)}

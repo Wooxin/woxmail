@@ -17,6 +17,7 @@ import {
   listFolders,
   listUnreadCounts,
   outlookOAuthLogin,
+  processOutbox,
   setAccountSettings,
   syncFolder,
   syncInboxes,
@@ -25,18 +26,21 @@ import { isTauriRuntime } from "./api/tauri"
 
 import Sidebar from "./components/Sidebar"
 import TitleBar from "./components/TitleBar"
-import WelcomeScreen from "./components/WelcomeScreen"
 import AddAccountModal from "./components/AddAccountModal"
 import MailScreen from "./components/MailScreen"
+import OutboxScreen from "./components/OutboxScreen"
+import ContactScreen from "./components/ContactScreen"
 import AddImapAccountModal from "./components/AddImapAccountModal"
 import SettingsModal from "./components/SettingsModal"
 import type { ImapAccountInput } from "./components/AddImapAccountModal"
 import type { AddAccountLoginMode } from "./components/AddAccountModal"
+import { useKeyboardShortcuts, type ShortcutAction } from "./hooks/useKeyboardShortcuts"
 import { isSelectableFolder } from "./utils/folders"
 
 type AccountFilterId = "all" | string
 type SidebarAccountMode = "list" | "dropdown"
 const inboxBackgroundSyncMs = 5 * 60_000
+const outboxBackgroundRetryMs = 60_000
 
 const providerPresets: Record<
   MailProvider,
@@ -160,6 +164,12 @@ function App() {
   const [showSettingsModal, setShowSettingsModal] =
     useState(false)
 
+  const [showOutbox, setShowOutbox] =
+    useState(false)
+
+  const [showContacts, setShowContacts] =
+    useState(false)
+
   const [editingAccount, setEditingAccount] =
     useState<MailAccount | null>(null)
 
@@ -203,23 +213,15 @@ function App() {
         const list = await listAccounts()
         if (cancelled) return
         setAccounts(list)
-        const folderEntries = await Promise.all(
-          list.map(async (account) => {
-            try {
-              return [
-                account.id,
-                await listFolders(account.id),
-              ] as const
-            } catch {
-              return [
-                account.id,
-                [],
-              ] as const
-            }
-          }),
-        )
-        if (cancelled) return
-        setFoldersByAccount(Object.fromEntries(folderEntries))
+
+        // Load folders in background without blocking UI
+        list.forEach((account) => {
+          listFolders(account.id).then((folders) => {
+            if (cancelled) return
+            setFoldersByAccount((prev) => ({ ...prev, [account.id]: folders }))
+          }).catch(() => {})
+        })
+
         const counts = await listUnreadCounts()
         if (cancelled) return
         setUnreadCounts(counts)
@@ -243,8 +245,8 @@ function App() {
       if (syncing || cancelled) return
       syncing = true
       try {
-        const inserted = await syncInboxes()
-        if (!cancelled && inserted > 0) {
+        await syncInboxes()
+        if (!cancelled) {
           await refreshUnreadCounts()
         }
       } catch {
@@ -256,6 +258,33 @@ function App() {
 
     const startupTimer = window.setTimeout(() => void run(), 8_000)
     const interval = window.setInterval(() => void run(), inboxBackgroundSyncMs)
+
+    return () => {
+      cancelled = true
+      window.clearTimeout(startupTimer)
+      window.clearInterval(interval)
+    }
+  }, [accounts.length])
+
+  useEffect(() => {
+    if (!isTauriRuntime() || accounts.length === 0) return
+
+    let running = false
+    let cancelled = false
+    const run = async () => {
+      if (running || cancelled) return
+      running = true
+      try {
+        await processOutbox()
+      } catch {
+        // Failed outbox jobs stay queued with backoff in the database.
+      } finally {
+        running = false
+      }
+    }
+
+    const startupTimer = window.setTimeout(() => void run(), 3_000)
+    const interval = window.setInterval(() => void run(), outboxBackgroundRetryMs)
 
     return () => {
       cancelled = true
@@ -528,16 +557,31 @@ function App() {
   }
 
   const selectAccount = (accountId: AccountFilterId) => {
+    setShowContacts(false)
+    setShowOutbox(false)
     startTransition(() => {
       setSelectedAccountId(accountId)
     })
   }
 
   const selectFolder = (folder: MailFolder) => {
+    setShowContacts(false)
+    setShowOutbox(false)
     startTransition(() => {
       setSelectedFolder(folder)
     })
   }
+
+  useKeyboardShortcuts((action: ShortcutAction) => {
+    switch (action) {
+      case "compose":
+        // Trigger compose via MailScreen internal state — handled by component
+        break
+      case "refresh":
+        void refreshUnreadCounts()
+        break
+    }
+  })
 
   const visibleFolders = useMemo(
     () => mergeVisibleFolders(accounts, foldersByAccount, selectedAccountId),
@@ -588,10 +632,16 @@ function App() {
           }
           onEditAccount={editAccountLogin}
           onDeleteAccount={removeAccount}
+          onOpenOutbox={() => { setShowContacts(false); setShowOutbox(true) }}
+          onOpenContacts={() => { setShowOutbox(false); setShowContacts(true) }}
           error={accountError}
         />
 
-        {accounts.length > 0 ? (
+        {showContacts ? (
+          <ContactScreen dark={dark} />
+        ) : showOutbox ? (
+          <OutboxScreen dark={dark} />
+        ) : (
           <MailScreen
             dark={dark}
             accounts={accounts}
@@ -601,13 +651,6 @@ function App() {
             foldersByAccount={foldersByAccount}
             onFolderChange={selectFolder}
             onUnreadCountsChanged={refreshUnreadCounts}
-          />
-        ) : (
-          <WelcomeScreen
-            dark={dark}
-            onAdd={() =>
-              setShowAddModal(true)
-            }
           />
         )}
       </div>

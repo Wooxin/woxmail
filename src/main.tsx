@@ -4,6 +4,11 @@ import App from "./App.tsx"
 import "./App.css"
 import "./i18n"
 
+// Disable default browser right-click context menu
+document.addEventListener("contextmenu", (event) => {
+  event.preventDefault()
+})
+
 ReactDOM.createRoot(
   document.getElementById("root")!,
 ).render(

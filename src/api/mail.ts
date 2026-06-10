@@ -5,6 +5,7 @@ import type {
   ComposeDraft,
   MessageDetail,
   MessageSummary,
+  OutboxJob,
   SendMessageInput,
   UnreadCount,
 } from "../types/mail"
@@ -173,6 +174,16 @@ export async function sendMessage(input: SendMessageInput): Promise<string> {
   )
 }
 
+export async function processOutbox(): Promise<{
+  attempted: number
+  sent: number
+  failed: number
+}> {
+  return tauriInvoke(
+    "process_outbox",
+  )
+}
+
 export async function getComposeDraft(scope: string): Promise<ComposeDraft | null> {
   return tauriInvoke<ComposeDraft | null>(
     "get_compose_draft",
@@ -244,4 +255,68 @@ export async function setAccountSettings(input: {
       },
     },
   )
+}
+
+export async function listOutboxJobs(): Promise<OutboxJob[]> {
+  return tauriInvoke<OutboxJob[]>("list_outbox_jobs")
+}
+
+export async function retryOutboxJob(jobId: string): Promise<void> {
+  await tauriInvoke<void>("retry_outbox_job", { jobId })
+}
+
+export async function cancelOutboxJob(jobId: string): Promise<void> {
+  await tauriInvoke<void>("cancel_outbox_job", { jobId })
+}
+
+export async function translateMessage(text: string, toLang?: string): Promise<string> {
+  const appid = window.localStorage.getItem("woxmail.translateAppid") ?? undefined
+  const secret = window.localStorage.getItem("woxmail.translateSecret") ?? undefined
+  return tauriInvoke<string>("translate_message", { text, toLang: toLang ?? null, appid: appid ?? null, secret: secret ?? null })
+}
+
+export async function importMbox(accountId: string, folderPath: string, filePath: string): Promise<number> {
+  return tauriInvoke<number>("import_mbox", { accountId, folderPath, filePath })
+}
+
+export async function importEml(accountId: string, folderPath: string, filePath: string): Promise<number> {
+  return tauriInvoke<number>("import_eml", { accountId, folderPath, filePath })
+}
+
+export interface FilterRule {
+  id: string
+  name: string
+  field: string
+  operator: string
+  value: string
+  action_type: string
+  action_value: string
+  enabled: boolean
+  sort_order: number
+}
+
+export async function listFilterRules(): Promise<FilterRule[]> {
+  return tauriInvoke<FilterRule[]>("list_filter_rules")
+}
+
+export async function createFilterRule(input: {
+  name: string; field: string; operator: string; value: string; action_type: string; action_value: string
+}): Promise<FilterRule> {
+  return tauriInvoke<FilterRule>("create_filter_rule", { input })
+}
+
+export async function deleteFilterRule(ruleId: string): Promise<void> {
+  await tauriInvoke<void>("delete_filter_rule", { ruleId })
+}
+
+export async function toggleFilterRule(ruleId: string, enabled: boolean): Promise<void> {
+  await tauriInvoke<void>("toggle_filter_rule", { ruleId, enabled })
+}
+
+export async function applyFilters(messageId: string): Promise<string[]> {
+  return tauriInvoke<string[]>("apply_filters", { messageId })
+}
+
+export async function getThread(messageId: string, accountId: string): Promise<MessageSummary[]> {
+  return tauriInvoke<MessageSummary[]>("get_thread", { messageId, accountId })
 }

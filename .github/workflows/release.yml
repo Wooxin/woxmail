@@ -1,39 +1,61 @@
-name: Release
+name: Build & Release
 
 on:
   push:
+    branches: [main]
     tags:
-      - "v*"
-  workflow_dispatch:
+      - 'v*'
 
 jobs:
-  build-windows:
-    name: Build Windows Installer
-    runs-on: windows-latest
+  build:
+    strategy:
+      matrix:
+        os: [windows-latest]
+
+    runs-on: ${{ matrix.os }}
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Node
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 22
-          cache: npm
+          node-version: '20'
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: actions-rust-lang/setup-rust-toolchain@v1
 
-      - name: Install frontend dependencies
+      - name: Install dependencies
         run: npm ci
 
-      - name: Build Tauri app
-        run: npm run tauri build
+      - name: Build frontend
+        run: npm run build
 
-      - name: Upload Windows bundles
-        uses: actions/upload-artifact@v4
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          name: woxmail-windows
-          path: |
-            src-tauri/target/release/bundle/**/*.msi
-            src-tauri/target/release/bundle/**/*.exe
+          tagName: ${{ github.ref_name }}
+          releaseName: 'Wox Mail v__VERSION__'
+          releaseBody: |
+            ## Wox Mail v__VERSION__
+
+            高性能本地邮箱客户端，替代 Thunderbird。
+
+            ### 功能
+            - 多账户支持 (Gmail/Outlook OAuth + IMAP/SMTP)
+            - 安全 HTML 邮件渲染
+            - 全文搜索 (FTS5)
+            - 通讯录管理 + 联系人自动补全
+            - 邮件翻译 (百度 API)
+            - 邮件规则/过滤器
+            - 统一收件箱 + 会话视图
+            - mbox/eml 导入
+            - 便携模式 (数据在 exe 同级目录)
+
+            ### 安装
+            下载 .msi 安装包或 .exe 便携版运行。
+          releaseDraft: false
+          prerelease: false
+          args: '--target x86_64-pc-windows-msvc'

@@ -1,5 +1,5 @@
 import type { ReactNode } from "react"
-import { Folder, KeyRound, Mail, Plus, Trash2 } from "lucide-react"
+import { Folder, KeyRound, Mail, Plus, Send, Trash2, UsersRound } from "lucide-react" 
 import { useTranslation } from "react-i18next"
 import type { MailAccount, MailFolder, MailFolderInfo } from "../types/mail"
 import { folderDisplayName, isSelectableFolder } from "../utils/folders"
@@ -20,6 +20,8 @@ type Props = {
   onAdd: () => void
   onEditAccount: (account: MailAccount) => void
   onDeleteAccount: (account: MailAccount) => void
+  onOpenOutbox: () => void
+  onOpenContacts: () => void
 }
 
 function Sidebar({
@@ -38,6 +40,8 @@ function Sidebar({
   onAdd,
   onEditAccount,
   onDeleteAccount,
+  onOpenOutbox,
+  onOpenContacts,
 }: Props) {
   const { t } = useTranslation()
   const selectedAccount = accounts.find((account) => account.id === selectedAccountId) ?? null
@@ -219,6 +223,28 @@ function Sidebar({
 
       </div>
       <div className={`shrink-0 border-t p-4 ${dark ? "border-white/10" : "border-black/10"}`}>
+        {accounts.length > 0 && (
+          <>
+            <button
+              onClick={onOpenContacts}
+              className={`mb-2 flex w-full items-center justify-center gap-2 rounded-2xl p-4 transition ${
+                dark ? "bg-white/5 text-zinc-200 hover:bg-white/10" : "bg-black/5 text-zinc-700 hover:bg-black/10"
+              }`}
+            >
+              <UsersRound size={18} />
+              通讯录
+            </button>
+            <button
+              onClick={onOpenOutbox}
+              className={`mb-3 flex w-full items-center justify-center gap-2 rounded-2xl p-4 transition ${
+                dark ? "bg-white/5 text-zinc-200 hover:bg-white/10" : "bg-black/5 text-zinc-700 hover:bg-black/10"
+              }`}
+            >
+              <Send size={18} />
+              发件箱
+            </button>
+          </>
+        )}
         <button
           onClick={onAdd}
           className={`flex w-full items-center justify-center gap-2 rounded-2xl border border-dashed p-4 transition ${dark ? "border-white/10 hover:bg-white/5" : "border-black/10 hover:bg-black/5"}`}

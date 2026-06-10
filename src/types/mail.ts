@@ -59,6 +59,8 @@ export interface MessageDetail {
 	to_emails: string[]
 	date_ts: number
 	body: string
+	body_html?: string | null
+	is_html: boolean
 	is_read: boolean
 	attachments: MessageAttachment[]
 	tags: string[]
@@ -104,4 +106,52 @@ export interface AccountSettings {
 	smtp_tls: boolean
 	smtp_username: string
 	has_password: boolean
+}
+
+export interface OutboxJob {
+	id: string
+	account_id: string
+	to_emails: string[]
+	subject: string
+	body: string
+	is_html: boolean
+	sent_folder_path: string
+	status: string
+	attempts: number
+	last_error: string | null
+	next_attempt_at: number
+	created_at: number
+	updated_at: number
+}
+
+export interface CacheSettings {
+	body_retention_days: number
+	attachment_max_mb: number
+	total_cache_max_mb: number
+}
+
+export interface CacheStats {
+	message_count: number
+	attachment_count: number
+	total_body_bytes: number
+	total_attachment_bytes: number
+	db_size_bytes: number
+}
+
+export interface Contact {
+	id: string
+	name: string
+	email: string
+	phone?: string | null
+	notes?: string | null
+	avatar_url?: string | null
+	created_at: number
+	updated_at: number
+}
+
+export interface CreateContactInput {
+	name: string
+	email: string
+	phone?: string | null
+	notes?: string | null
 }
